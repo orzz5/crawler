@@ -1,0 +1,17 @@
+{
+  "name": "api-grabber-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Full-stack web application for crawling websites and automated public API discovery",
+  "scripts": {
+    "install:all": "npm install && cd server && npm install && cd ../client && npm install",
+    "playwright:install": "cd server && npx playwright install chromium",
+    "dev": "concurrently -n \"SERVER,CLIENT\" -c \"bgBlue.bold,bgMagenta.bold\" \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:server": "cd server && npm run dev",
+    "dev:client": "cd client && npm run dev",
+    "build": "cd server && npm run build && cd ../client && npm run build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
