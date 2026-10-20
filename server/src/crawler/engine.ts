@@ -9,7 +9,7 @@ import type {
   LogLevel
 } from '../types/index.js';
 import { normalizeUrl, isSameOriginOrDomain, isStaticAssetUrl } from './urlUtils.js';
-import { isApiCandidate, extractCapturedEndpoint } from './detector.js';
+import { isApiCandidate, extractCapturedEndpoint, classifyAuthentication } from './detector.js';
 
 interface QueueItem {
   url: string;
@@ -160,38 +160,56 @@ export class CrawlerEngine {
 
     try {
       this.log(sessionId, 'info', 'Launching headless Chromium instance...');
-      browser = await chromium.launch({
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-gpu',
-          '--disable-software-rasterizer',
-          '--no-zygote',
-          '--single-process',
-          '--disable-extensions',
-          '--disable-background-networking',
-          '--disable-background-timer-throttling',
-          '--disable-backgrounding-occluded-windows',
-          '--disable-breakpad',
-          '--disable-component-update',
-          '--disable-default-apps',
-          '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process',
-          '--disable-ipc-flooding-protection',
-          '--disable-renderer-backgrounding',
-          '--memory-pressure-off',
-          '--js-flags=--max-old-space-size=256'
-        ]
-      });
-
-      this.activeBrowsers.set(sessionId, browser);
+      try {
+        browser = await chromium.launch({
+          headless: true,
+          args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-software-rasterizer',
+            '--no-zygote',
+            '--disable-extensions',
+            '--disable-background-networking',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-breakpad',
+            '--disable-component-update',
+            '--disable-default-apps',
+            '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process',
+            '--disable-ipc-flooding-protection',
+            '--disable-renderer-backgrounding',
+            '--blink-settings=imagesEnabled=false',
+            '--disable-remote-fonts',
+            '--disk-cache-dir=/tmp/cache',
+            '--disk-cache-size=1',
+            '--media-cache-size=1',
+            '--memory-pressure-off',
+            '--js-flags=--max-old-space-size=128'
+          ]
+        });
+        this.activeBrowsers.set(sessionId, browser);
+      } catch (launchErr: any) {
+        this.log(sessionId, 'warn', `Headless Chromium launch failed: ${launchErr.message}. Falling back to lightweight HTTP discovery engine.`);
+        await this.runHttpFallbackTask(sessionId, signal, startTime);
+        return;
+      }
 
       context = await browser.newContext({
         userAgent:
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 API-Discovery-Crawler/1.0',
         viewport: { width: 800, height: 600 },
         ignoreHTTPSErrors: true
+      });
+
+      // Context-level resource blocking to prevent heavy assets from loading into RAM
+      await context.route('**/*', (route) => {
+        const type = route.request().resourceType();
+        if (['image', 'font', 'media', 'stylesheet', 'imageset'].includes(type)) {
+          return route.abort();
+        }
+        return route.continue();
       });
 
       const queue: QueueItem[] = [{ url: config.startUrl, depth: 0 }];
@@ -350,7 +368,8 @@ export class CrawlerEngine {
         } finally {
           if (page) {
             try {
-              await page.close();
+              await page.goto('about:blank').catch(() => {});
+              await page.close().catch(() => {});
             } catch {
               // ignore
             }
@@ -405,6 +424,176 @@ export class CrawlerEngine {
       this.activeBrowsers.delete(sessionId);
       this.abortControllers.delete(sessionId);
     }
+  }
+
+  private async runHttpFallbackTask(sessionId: string, signal: AbortSignal, startTime: number) {
+    const session = this.sessions.get(sessionId)!;
+    const config = session.config;
+    const queue: QueueItem[] = [{ url: config.startUrl, depth: 0 }];
+    const visited = new Set<string>();
+    const queued = new Set<string>([config.startUrl]);
+    const seenEndpoints = new Set<string>();
+
+    this.log(sessionId, 'info', 'Activated Lightweight HTTP & Script Analyzer (Zero-Browser RAM Mode).');
+
+    while (queue.length > 0 && !signal.aborted) {
+      if (session.stats.pagesScanned >= config.maxPages!) break;
+
+      const current = queue.shift()!;
+      const currentUrl = current.url;
+      visited.add(currentUrl);
+      session.currentUrl = currentUrl;
+
+      this.emit(sessionId, { type: 'PAGE_START', url: currentUrl, depth: current.depth });
+      this.log(sessionId, 'info', `Scanning [Depth ${current.depth}]: ${currentUrl}`);
+
+      const pageResult: PageCrawlResult = {
+        url: currentUrl,
+        depth: current.depth,
+        status: 'scanning',
+        discoveredInternalLinks: [],
+        endpointsCount: 0
+      };
+      session.pages[currentUrl] = pageResult;
+
+      try {
+        const resp = await fetch(currentUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) API-Discovery-Crawler/1.0',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+          },
+          signal: AbortSignal.timeout(config.pageTimeoutMs || 15000)
+        });
+
+        pageResult.statusCode = resp.status;
+        const html = await resp.text();
+
+        const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+        if (titleMatch) pageResult.title = titleMatch[1].trim();
+
+        // Discover internal links
+        if (current.depth < config.maxDepth!) {
+          const linkRegex = /<a\s+(?:[^>]*?\s+)?href=["']([^"']*)["']/gi;
+          let match: RegExpExecArray | null;
+          while ((match = linkRegex.exec(html)) !== null) {
+            const rawHref = match[1];
+            const normalized = normalizeUrl(rawHref, currentUrl);
+            if (!normalized || !isSameOriginOrDomain(normalized, config.startUrl) || isStaticAssetUrl(normalized)) continue;
+
+            if (!pageResult.discoveredInternalLinks.includes(normalized)) {
+              pageResult.discoveredInternalLinks.push(normalized);
+            }
+            if (!visited.has(normalized) && !queued.has(normalized)) {
+              queued.add(normalized);
+              queue.push({ url: normalized, depth: current.depth + 1 });
+              session.stats.pagesQueued = queued.size;
+            }
+          }
+        }
+
+        // Discover candidate APIs from scripts and links
+        const apiPatterns = [
+          /["'](\/(?:api|v\d+|graphql|rest)[^"'\s<>]*)["']/gi,
+          /["'](https?:\/\/[^"'\s<>]+\/(?:api|v\d+|graphql|rest)[^"'\s<>]*)["']/gi
+        ];
+
+        const candidateUrls = new Set<string>();
+        for (const pattern of apiPatterns) {
+          let apiMatch: RegExpExecArray | null;
+          while ((apiMatch = pattern.exec(html)) !== null) {
+            const candidate = normalizeUrl(apiMatch[1], currentUrl);
+            if (candidate && !isStaticAssetUrl(candidate)) {
+              candidateUrls.add(candidate);
+            }
+          }
+        }
+
+        // Test candidate endpoints
+        for (const apiUrl of candidateUrls) {
+          if (signal.aborted) break;
+          const dedupeKey = `GET:${apiUrl}:${currentUrl}`;
+          if (seenEndpoints.has(dedupeKey)) continue;
+
+          try {
+            const apiReqStart = Date.now();
+            const apiResp = await fetch(apiUrl, {
+              headers: { 'User-Agent': 'Mozilla/5.0 API-Discovery-Crawler/1.0' },
+              signal: AbortSignal.timeout(5000)
+            });
+
+            const contentType = (apiResp.headers.get('content-type') || '').toLowerCase();
+            const isJson = contentType.includes('application/json') || contentType.includes('application/xml');
+
+            if (isJson || apiResp.status === 200 || apiResp.status === 401 || apiResp.status === 403) {
+              seenEndpoints.add(dedupeKey);
+              let body: any = null;
+              try {
+                const text = await apiResp.text();
+                body = JSON.parse(text);
+              } catch {
+                body = null;
+              }
+
+              const reqHeadersRecord: Record<string, string> = {};
+              const resHeadersRecord: Record<string, string> = {};
+              apiResp.headers.forEach((v, k) => { resHeadersRecord[k] = v; });
+
+              const authClassification = classifyAuthentication(reqHeadersRecord, apiResp.status);
+
+              const endpoint: CapturedEndpoint = {
+                id: uuidv4(),
+                pageUrl: currentUrl,
+                method: 'GET',
+                url: apiUrl,
+                pathname: new URL(apiUrl).pathname + new URL(apiUrl).search,
+                origin: new URL(apiUrl).origin,
+                status: apiResp.status,
+                statusText: apiResp.statusText,
+                contentType,
+                responseTimeMs: Date.now() - apiReqStart,
+                resourceType: 'fetch',
+                authClassification,
+                requestHeaders: reqHeadersRecord,
+                responseHeaders: resHeadersRecord,
+                requestBody: null,
+                responseBody: body,
+                responseSize: body ? JSON.stringify(body).length : 0,
+                timestamp: new Date().toISOString()
+              };
+
+              session.endpoints.push(endpoint);
+              pageResult.endpointsCount++;
+              session.stats.totalApisFound++;
+              if (authClassification.isPublic) session.stats.publicApisFound++;
+              else session.stats.protectedApisFound++;
+
+              this.emit(sessionId, { type: 'ENDPOINT_FOUND', endpoint, stats: session.stats });
+              this.log(sessionId, 'api', `Discovered [GET] ${apiUrl} (${apiResp.status} ${apiResp.statusText || 'OK'})`);
+            }
+          } catch {
+            // Ignore individual probe failures
+          }
+        }
+
+        pageResult.status = 'completed';
+        session.stats.pagesScanned++;
+      } catch (err: any) {
+        pageResult.status = 'failed';
+        pageResult.error = err.message || 'Page request failed';
+        session.stats.pagesFailed++;
+        this.log(sessionId, 'error', `Failed visiting ${currentUrl}: ${pageResult.error}`);
+      }
+
+      session.stats.durationMs = Date.now() - startTime;
+      this.emit(sessionId, { type: 'PAGE_COMPLETE', page: pageResult, stats: session.stats });
+    }
+
+    session.status = signal.aborted ? 'stopped' : 'completed';
+    session.currentUrl = null;
+    session.stats.endTime = new Date().toISOString();
+    session.stats.durationMs = Date.now() - startTime;
+    this.emit(sessionId, signal.aborted ? { type: 'SESSION_STOPPED', session } : { type: 'SESSION_COMPLETE', session });
+    this.log(sessionId, 'success', `Scan complete! Scanned ${session.stats.pagesScanned} pages, discovered ${session.stats.totalApisFound} endpoints.`);
   }
 
   public cleanup() {

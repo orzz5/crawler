@@ -170,9 +170,11 @@ const shutdown = () => {
 
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Promise Rejection:', reason);
+});
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
-  crawlerEngine.cleanup();
 });
 
 app.listen(PORT, '0.0.0.0', () => {

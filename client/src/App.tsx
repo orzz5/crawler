@@ -125,7 +125,21 @@ export const App: React.FC = () => {
       };
 
       sse.onerror = (err) => {
-        console.warn('SSE connection error or closed:', err);
+        console.warn('SSE connection closed:', err);
+        setSession((prev) => {
+          if (prev && prev.status === 'running') {
+            return {
+              ...prev,
+              status: 'stopped',
+              stats: {
+                ...prev.stats,
+                endTime: new Date().toISOString()
+              }
+            };
+          }
+          return prev;
+        });
+        sse.close();
       };
     } catch (err: any) {
       setApiError(err.message || 'Failed to start crawl');
@@ -135,9 +149,13 @@ export const App: React.FC = () => {
   const handleStopCrawl = async () => {
     if (!session || !isCrawling) return;
     try {
-      await fetch(`${API_BASE}/api/crawl/stop/${session.id}`, { method: 'POST' });
+      const res = await fetch(`${API_BASE}/api/crawl/stop/${session.id}`, { method: 'POST' });
+      if (!res.ok) {
+        setSession((prev) => (prev ? { ...prev, status: 'stopped' } : null));
+      }
     } catch (err) {
-      console.error('Failed to stop crawl:', err);
+      console.warn('Failed to stop crawl:', err);
+      setSession((prev) => (prev ? { ...prev, status: 'stopped' } : null));
     }
   };
 
