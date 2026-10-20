@@ -26,7 +26,8 @@ When provided with a target URL, the engine crawls internal subpages using a hea
 ### 2. Backend (Server)
 - **Runtime:** Node.js with Express and TypeScript.
 - **Role:** Exposes REST endpoints to start/stop crawls, queries session states, streams SSE events, and generates export downloads.
-- **Crawl Engine:** Headless Playwright Chromium (`chromium.launch({ headless: true })`).
+- **Crawl Engine:** Headless Playwright Chromium (`chromium.launch({ headless: true, args: [...] })`).
+  - Configured with container flags (`--no-sandbox`, `--disable-setuid-sandbox`, `--disable-dev-shm-usage`, `--disable-gpu`, `--single-process`) to operate reliably in low-memory Docker/Render container environments.
   - Traverses internal `<a href="...">` links while staying strictly within the same origin/domain.
   - Supports configurable crawl depth (1–5 levels) and page limits (5–50 pages).
   - Handles client-side hydration delays to allow modern SPAs (React, Next.js, Vue) to trigger async data fetches.

@@ -175,8 +175,8 @@ process.on('uncaughtException', (err) => {
   crawlerEngine.cleanup();
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n======================================================`);
-  console.log(`🚀 API Grabber Crawler Server running at http://localhost:${PORT}`);
+  console.log(`🚀 API Grabber Crawler Server running at http://0.0.0.0:${PORT}`);
   console.log(`======================================================\n`);
 });
