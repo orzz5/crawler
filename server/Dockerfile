@@ -18,6 +18,7 @@ RUN npm run build
 # Expose port
 ENV PORT=3001
 ENV NODE_ENV=production
+ENV NODE_OPTIONS="--max-old-space-size=192"
 EXPOSE 3001
 
 # Start server

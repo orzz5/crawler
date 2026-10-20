@@ -167,9 +167,21 @@ export class CrawlerEngine {
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
           '--disable-gpu',
-          '--no-first-run',
+          '--disable-software-rasterizer',
           '--no-zygote',
-          '--single-process'
+          '--single-process',
+          '--disable-extensions',
+          '--disable-background-networking',
+          '--disable-background-timer-throttling',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-breakpad',
+          '--disable-component-update',
+          '--disable-default-apps',
+          '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process',
+          '--disable-ipc-flooding-protection',
+          '--disable-renderer-backgrounding',
+          '--memory-pressure-off',
+          '--js-flags=--max-old-space-size=256'
         ]
       });
 
@@ -178,7 +190,7 @@ export class CrawlerEngine {
       context = await browser.newContext({
         userAgent:
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 API-Discovery-Crawler/1.0',
-        viewport: { width: 1366, height: 768 },
+        viewport: { width: 800, height: 600 },
         ignoreHTTPSErrors: true
       });
 
@@ -213,6 +225,16 @@ export class CrawlerEngine {
         let page: Page | null = null;
         try {
           page = await context.newPage();
+
+          // Abort heavy resources (images, fonts, stylesheets, media) so they do not consume memory
+          await page.route('**/*', (route) => {
+            const request = route.request();
+            const type = request.resourceType();
+            if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
+              return route.abort();
+            }
+            return route.continue();
+          });
 
           // Intercept network responses on this page
           const pendingCaptures: Promise<void>[] = [];
